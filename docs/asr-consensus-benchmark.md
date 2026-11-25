@@ -63,7 +63,7 @@ The voters run sequentially in isolated processes. Their memory is not additive.
 
 ### ROVER Merge
 
-`transcription_consensus.py` aligns Cohere and Parakeet to the Whisper word stream. It chooses words, insertions, deletions, and punctuation by strict three-voter majority. Whisper supplies surface spelling and punctuation only when a vote is tied. No benchmark reference, language model, glossary, or model-specific confidence is used during merging.
+`services/transcription/src/assistant_transcription/consensus/merge.py` aligns Cohere and Parakeet to the Whisper word stream. It chooses words, insertions, deletions, and punctuation by strict three-voter majority. Whisper supplies surface spelling and punctuation only when a vote is tied. No benchmark reference, language model, glossary, or model-specific confidence is used during merging.
 
 ## VRAM Measurement
 
@@ -101,8 +101,8 @@ This validates the selective merge and gives a smaller latency penalty than full
 ```bash
 cd ~/Dev/assistant
 UV_CACHE_DIR=/data/.cache/uv uv sync --extra consensus
-UV_CACHE_DIR=/data/.cache/uv uv sync --project consensus_cohere
-uv run python whisper_service.py --backend consensus --device cuda
+UV_CACHE_DIR=/data/.cache/uv uv sync --project services/transcription/workers/cohere
+uv run assistant-transcription --backend consensus --device cuda
 ```
 
 The Cohere model is gated. The Hugging Face account used by the service must have accepted the model terms and be authenticated locally.

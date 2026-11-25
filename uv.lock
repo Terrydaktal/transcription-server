@@ -13,6 +13,12 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "assistant",
+    "assistant-transcription",
+]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -218,13 +224,50 @@ name = "assistant"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "assistant-transcription" },
+]
+
+[package.optional-dependencies]
+canary = [
+    { name = "assistant-transcription", extra = ["canary"] },
+]
+consensus = [
+    { name = "assistant-transcription", extra = ["consensus"] },
+]
+granite-speech = [
+    { name = "assistant-transcription", extra = ["granite-speech"] },
+]
+parakeet = [
+    { name = "assistant-transcription", extra = ["parakeet"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "assistant-transcription", editable = "services/transcription" },
+    { name = "assistant-transcription", extras = ["canary"], marker = "extra == 'canary'", editable = "services/transcription" },
+    { name = "assistant-transcription", extras = ["consensus"], marker = "extra == 'consensus'", editable = "services/transcription" },
+    { name = "assistant-transcription", extras = ["granite-speech"], marker = "extra == 'granite-speech'", editable = "services/transcription" },
+    { name = "assistant-transcription", extras = ["parakeet"], marker = "extra == 'parakeet'", editable = "services/transcription" },
+]
+provides-extras = ["canary", "parakeet", "granite-speech", "consensus"]
+
+[[package]]
+name = "assistant-transcription"
+version = "0.1.0"
+source = { editable = "services/transcription" }
+dependencies = [
+    { name = "av" },
+    { name = "ctranslate2" },
     { name = "english-variant-converter" },
     { name = "fastapi" },
     { name = "faster-whisper" },
+    { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "nvidia-cublas-cu12" },
     { name = "nvidia-cudnn-cu12" },
+    { name = "onnxruntime" },
     { name = "python-multipart" },
+    { name = "tokenizers" },
     { name = "uvicorn" },
 ]
 
@@ -255,22 +298,27 @@ parakeet = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = "==17.1.0" },
+    { name = "ctranslate2", specifier = "==4.8.0" },
     { name = "english-variant-converter", git = "https://github.com/TrelisResearch/whisper-english-variant-converter.git" },
     { name = "fastapi", specifier = ">=0.137.1" },
-    { name = "faster-whisper", specifier = ">=1.2.1" },
+    { name = "faster-whisper", specifier = "==1.2.1" },
     { name = "httpx", marker = "extra == 'granite-speech'", specifier = ">=0.28.1" },
+    { name = "huggingface-hub", specifier = "==0.36.2" },
     { name = "nemo-toolkit", extras = ["asr"], marker = "extra == 'canary'" },
     { name = "nemo-toolkit", extras = ["asr"], marker = "extra == 'consensus'", specifier = ">=2.7.3" },
     { name = "nemo-toolkit", extras = ["asr"], marker = "extra == 'parakeet'" },
-    { name = "numpy", specifier = ">=2.0" },
+    { name = "numpy", specifier = "==2.4.6" },
     { name = "nvidia-cublas-cu12", specifier = "==12.8.4.1" },
     { name = "nvidia-cudnn-cu12", specifier = "==9.19.0.56" },
+    { name = "onnxruntime", specifier = "==1.27.0" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "rapidfuzz", marker = "extra == 'consensus'", specifier = ">=3.14.3" },
     { name = "silero-vad", marker = "extra == 'consensus'", specifier = ">=6.2.1" },
     { name = "silero-vad", marker = "extra == 'parakeet'", specifier = ">=6.2.1" },
     { name = "soundfile", marker = "extra == 'consensus'", specifier = ">=0.14.0" },
     { name = "soundfile", marker = "extra == 'parakeet'", specifier = ">=0.14.0" },
+    { name = "tokenizers", specifier = "==0.22.2" },
     { name = "torch", marker = "extra == 'canary'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'consensus'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'parakeet'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },

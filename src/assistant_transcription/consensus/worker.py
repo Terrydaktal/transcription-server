@@ -6,7 +6,9 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-from whisper_service import PARAKEET_PRESETS, build_runtime_config, build_transcriber
+from .. import environment  # noqa: F401 - Configure caches and CUDA before loading a voter.
+from ..backends import build_transcriber
+from ..config import PARAKEET_PRESETS, build_runtime_config
 
 
 def main() -> None:

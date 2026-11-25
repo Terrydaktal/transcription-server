@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from audio_preprocessing import analyze_audio, prepare_audio_for_transcription
+from assistant_transcription.preprocessing import analyze_audio, prepare_audio_for_transcription
 
 
 def write_wav(path: Path, samples: np.ndarray) -> None:
@@ -78,7 +78,7 @@ class AudioPreprocessingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _, contaminated_path = self.make_recordings(directory)
             with patch(
-                "audio_preprocessing.subprocess.run",
+                "assistant_transcription.preprocessing.subprocess.run",
                 side_effect=RuntimeError("ffmpeg unavailable"),
             ), prepare_audio_for_transcription(contaminated_path) as result:
                 self.assertFalse(result.filter_applied)

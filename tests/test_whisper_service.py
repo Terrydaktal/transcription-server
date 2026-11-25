@@ -1,5 +1,7 @@
+import io
 import logging
 import os
+import re
 import tempfile
 import unittest
 import wave
@@ -7,6 +9,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+from starlette.requests import Request
+from uvicorn.logging import DefaultFormatter
 
 from whisper_service import (
     ANSI_BREAKDOWN_VALUE,
@@ -20,11 +25,13 @@ from whisper_service import (
     build_runtime_config,
     canonicalize_technical_text,
     colour_timing_fields,
+    configure_shared_model_caches,
     default_model_for_backend,
     first_nemo_transcription_text,
     format_audio_size,
     format_client_preparation,
     format_timing_fields,
+    format_transcription_device,
     load_whisper_hotwords,
     normalize_technical_text,
     parse_parakeet_channel_selector,
@@ -33,8 +40,25 @@ from whisper_service import (
     preserve_keyword_casing,
     protect_technical_terms,
     restore_technical_terms,
+    transcribe_raw,
     write_recovery_copy,
 )
+
+
+class SharedModelCacheTests(unittest.TestCase):
+    def test_uses_xdg_cache_and_preserves_explicit_overrides(self):
+        with patch.dict(
+            os.environ,
+            {
+                "XDG_CACHE_HOME": "/shared/cache",
+                "HF_HOME": "/custom/huggingface",
+            },
+            clear=True,
+        ):
+            configure_shared_model_caches()
+
+            self.assertEqual(os.environ["HF_HOME"], "/custom/huggingface")
+            self.assertEqual(os.environ["TORCH_HOME"], "/shared/cache/torch")
 
 
 class FasterWhisperBatchingTests(unittest.TestCase):
@@ -143,6 +167,7 @@ class FasterWhisperBatchingTests(unittest.TestCase):
         transcriber._transcribe_with_model = Mock(return_value="ordinary")
 
         self.assertEqual(transcriber.transcribe_file("audio.wav"), "batched")
+        self.assertEqual(format_transcription_device(transcriber), "GPU")
         transcriber._transcribe_batched.assert_called_once_with(transcriber.model, "audio.wav")
         transcriber._transcribe_with_model.assert_not_called()
 
@@ -170,6 +195,7 @@ class FasterWhisperBatchingTests(unittest.TestCase):
         transcriber._transcribe_with_model = Mock(return_value="ordinary")
 
         self.assertEqual(transcriber.transcribe_file("audio.wav"), "ordinary")
+        self.assertEqual(format_transcription_device(transcriber), "GPU")
         transcriber._release_cuda_cache.assert_called_once_with()
         transcriber._invalidate_primary_model.assert_not_called()
         transcriber._get_cpu_fallback_model.assert_not_called()
@@ -182,12 +208,30 @@ class FasterWhisperBatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(transcriber.transcribe_file("audio.wav"), "cpu result")
+        self.assertEqual(format_transcription_device(transcriber), "CPU(fallback)")
         transcriber._invalidate_primary_model.assert_called_once()
         transcriber._get_cpu_fallback_model.assert_called_once_with()
         self.assertEqual(
             transcriber._transcribe_with_model.call_args_list[1].args,
             ("cpu-model", "audio.wav"),
         )
+
+        transcriber._transcribe_batched = Mock(return_value="gpu result")
+        self.assertEqual(transcriber.transcribe_file("next.wav"), "gpu result")
+        self.assertEqual(format_transcription_device(transcriber), "GPU")
+
+    def test_device_reporting_uses_the_resolved_model_device(self):
+        for resolved_device, expected in (("cpu", "CPU"), ("cuda", "GPU")):
+            with self.subTest(device=resolved_device):
+                transcriber = self.make_transcriber(duration_seconds=1)
+                transcriber.config.device = "auto"
+                transcriber._get_primary_model.return_value = SimpleNamespace(
+                    model=SimpleNamespace(device=resolved_device)
+                )
+                transcriber._transcribe_with_model = Mock(return_value="result")
+
+                self.assertEqual(transcriber.transcribe_file("audio.wav"), "result")
+                self.assertEqual(format_transcription_device(transcriber), expected)
 
     def test_duration_probe_reads_wav_container_metadata(self):
         transcriber = FasterWhisperTranscriber.__new__(FasterWhisperTranscriber)
@@ -378,8 +422,9 @@ class ParakeetBackendTests(unittest.TestCase):
         ):
             config = build_runtime_config()
 
-        self.assertTrue(config.parakeet_key_phrases_file.endswith("programming_phrases.txt"))
-        self.assertTrue(Path(config.parakeet_key_phrases_file).is_file())
+        phrase_file = Path(config.parakeet_key_phrases_file)
+        self.assertEqual(phrase_file.name, "parakeet_programming_phrases.txt")
+        self.assertTrue(phrase_file.is_file())
 
     def test_parakeet_transcribes_one_file_without_progress_output(self):
         model = Mock()
@@ -534,7 +579,7 @@ class ParakeetBackendTests(unittest.TestCase):
             word_confidence=[0.75],
         )
 
-        with patch("whisper_service.print") as log:
+        with patch("assistant_transcription.backends.parakeet.print") as log:
             transcriber._log_word_diagnostics([hypothesis])
 
         self.assertIn(
@@ -654,7 +699,7 @@ class GraniteSpeechBackendTests(unittest.TestCase):
             audio_file.write(b"audio")
             audio_file.flush()
             with patch(
-                "whisper_service.prepare_granite_audio",
+                "assistant_transcription.backends.granite_speech.prepare_granite_audio",
                 return_value=nullcontext(audio_file.name),
             ):
                 result = transcriber.transcribe_file(audio_file.name)
@@ -758,6 +803,104 @@ class TimingFormatTests(unittest.TestCase):
             "audio_preprocess_ms=12 + server_transcribe_ms=692 + postprocess_ms=0 + "
             "temp_file_cleanup_ms=0)",
         )
+
+
+class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
+    async def render_request(
+        self,
+        *,
+        device,
+        fallback=False,
+        fail=False,
+        colour=False,
+        body=b"audio",
+    ):
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [],
+                "client": ("127.0.0.1", 1234),
+            },
+            receive=receive,
+        )
+        transcriber = SimpleNamespace(
+            last_inference_device=device,
+            last_inference_used_cpu_fallback=fallback,
+            transcribe_file=Mock(
+                side_effect=RuntimeError("fixture failure") if fail else None,
+                return_value="Test transcript.",
+            ),
+        )
+        prepared = SimpleNamespace(
+            transcription_path="fixture.audio",
+            analysis=None,
+            filtered_analysis=None,
+            filter_applied=False,
+            filter_reason="disabled",
+            error=None,
+            as_dict=lambda: {},
+        )
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(FriendlyLogSource())
+        formatter_config = build_log_config()["formatters"]["default"]
+        handler.setFormatter(DefaultFormatter(
+            fmt=formatter_config["fmt"],
+            datefmt=formatter_config["datefmt"],
+            use_colors=colour,
+        ))
+        logger = logging.Logger("assistant.whisper", level=logging.INFO)
+        logger.addHandler(handler)
+        logger.propagate = False
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(app.state, "runtime_config", build_runtime_config()),
+            patch.object(app.state, "transcriber", transcriber),
+            patch.object(app.state, "variant_post_processor", None),
+            patch("whisper_service.ensure_transcriber_loaded"),
+            patch("whisper_service.write_recovery_copy"),
+            patch("whisper_service.preserve_failed_request"),
+            patch("whisper_service.canonicalize_technical_text", side_effect=lambda text: text),
+            patch("whisper_service.prepare_audio_for_transcription", return_value=nullcontext(prepared)),
+            patch("assistant_transcription.log_output.service_logger", logger),
+        ):
+            response = await transcribe_raw(request)
+        return response, stream.getvalue(), transcriber
+
+    async def test_result_device_and_blank_separator_survive_console_formatting(self):
+        devices = (
+            ("cuda", False, "GPU"),
+            ("cpu", False, "CPU"),
+            ("cpu", True, "CPU(fallback)"),
+        )
+        for device, fallback, label in devices:
+            for colour in (False, True):
+                with self.subTest(device=label, colour=colour):
+                    response, output, _ = await self.render_request(
+                        device=device, fallback=fallback, colour=colour
+                    )
+                    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+                    self.assertEqual(response["text"], "Test transcript.")
+                    self.assertIn(f"outcome=success device={label}", plain)
+                    self.assertIn("Server: Transcribed Raw", plain)
+                    self.assertTrue(output.endswith("\n\n"), repr(output))
+                    self.assertFalse(output.endswith("\n\n\n"))
+
+    async def test_failed_request_reports_last_attempt_and_dividing_blank_line(self):
+        response, output, _ = await self.render_request(device="cpu", fallback=True, fail=True)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("outcome=failed device=CPU(fallback)", output)
+        self.assertTrue(output.endswith("\n\n"))
+
+    async def test_rejected_upload_does_not_reuse_previous_inference_device(self):
+        response, output, transcriber = await self.render_request(device="cuda", body=b"")
+        self.assertEqual(response.status_code, 400)
+        transcriber.transcribe_file.assert_not_called()
+        self.assertIn("outcome=failed device=not-run", output)
+        self.assertTrue(output.endswith("\n\n"))
 
 
 class RecoveryRetentionTests(unittest.TestCase):

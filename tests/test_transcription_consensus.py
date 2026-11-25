@@ -117,7 +117,6 @@ class ConsensusBackendTests(unittest.TestCase):
             hotwords="",
             long_audio_batch_size=2,
         )
-        transcriber.worker_path = "consensus_worker.py"
         transcriber.cohere_python = "cohere-python"
         transcriber.cohere_worker_path = "cohere-worker.py"
         transcriber.merge_transcripts = Mock(return_value="merged")
