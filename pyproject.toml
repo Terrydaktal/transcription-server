@@ -1,7 +1,8 @@
 [project]
 name = "assistant-transcription"
 version = "0.1.0"
-description = "Local speech-to-text service for Assistant"
+description = "Local GPU speech-to-text HTTP service (/transcribe_raw) with Whisper, Parakeet, Canary, Granite, and consensus backends"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "av==17.1.0",
@@ -50,6 +51,10 @@ assistant-transcription = "assistant_transcription.server:main"
 [build-system]
 requires = ["uv_build>=0.10,<0.11"]
 build-backend = "uv_build"
+
+[tool.uv]
+cache-dir = "/data/.cache/uv"
+link-mode = "hardlink"
 
 [tool.uv.sources]
 english-variant-converter = { git = "https://github.com/TrelisResearch/whisper-english-variant-converter.git" }

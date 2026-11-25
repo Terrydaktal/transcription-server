@@ -35,7 +35,7 @@ class ConsensusTranscriber:
         if not self.cohere_python.is_file():
             raise RuntimeError(
                 "The consensus Cohere environment is missing. Run "
-                "`UV_CACHE_DIR=/data/.cache/uv uv sync --project services/transcription/workers/cohere`."
+                "`UV_CACHE_DIR=/data/.cache/uv uv sync --project workers/cohere`."
             )
         print(
             "Consensus backend ready: fixed sequential voters are faster-whisper "

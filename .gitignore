@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+workers/cohere/.venv
+benchmarks/enhancement/.venv
+benchmarks/runtime/.venv
+.pytest_cache/
+.ruff_cache/
+.transcription_recovery/
+.tmp/
+*.log
