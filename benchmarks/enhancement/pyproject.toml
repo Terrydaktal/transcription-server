@@ -1,0 +1,20 @@
+[project]
+name = "asr-benchmark-enhancement"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "deepfilternet==0.5.6",
+    "scipy==1.17.1",
+    "soundfile==0.14.0",
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
