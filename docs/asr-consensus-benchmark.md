@@ -1,5 +1,7 @@
 # ASR Consensus Benchmark
 
+For the complete historical inventory, including earlier model comparisons, parameter sweeps, failed runs, and microphone preprocessing checks, see the [transcription experiment catalogue](asr-experiments.md), [CSV](asr-experiments.csv), and [JSON evidence](asr-experiments.json). This report focuses on the validated consensus configuration.
+
 ## Result
 
 The `consensus` backend is the first tested local configuration that improves both word error rate and punctuation over this project's current faster-whisper large-v3 configuration while remaining below 5 GiB peak VRAM on the RTX 5060.
