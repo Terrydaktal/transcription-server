@@ -1,9 +1,13 @@
+import errno
+import fcntl
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from logging.config import dictConfig
 from pathlib import Path
 
@@ -52,8 +56,93 @@ from .postprocessing import (
 from .preprocessing import prepare_audio_for_transcription
 
 
+def pipewire_microphone_sources() -> tuple[str, ...] | None:
+    """Return non-monitor PulseAudio/PipeWire capture sources, if probeable."""
+    pactl = shutil.which("pactl")
+    if pactl is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            [pactl, "list", "short", "sources"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    sources = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        source_name = fields[1]
+        if not source_name.endswith(".monitor"):
+            sources.append(source_name)
+    return tuple(sources)
+
+
+def report_microphone_startup_status() -> None:
+    sources = pipewire_microphone_sources()
+    if sources == ():
+        print(
+            "WARNING: No microphone is available through PipeWire/PulseAudio. "
+            "Local '+' dictation cannot use its normal capture path and will attempt "
+            "direct ALSA fallback; uploaded audio transcription is unaffected."
+        )
+    elif sources is None:
+        print(
+            "WARNING: Could not check for a PipeWire/PulseAudio microphone. "
+            "Uploaded audio transcription is unaffected."
+        )
+
+
+def resume_desktop_dictation_queue() -> None:
+    state_root = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+    ) / "assistant-desktop-dictation"
+    runtime_root = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    ) / "assistant-desktop-dictation"
+    try:
+        recordings = sorted((state_root / "queue").glob("recording-*.wav"))
+        try:
+            current = (runtime_root / "current-audio-path").read_text().strip()
+        except FileNotFoundError:
+            current = ""
+        pending = [path for path in recordings if str(path) != current]
+        if not pending:
+            return
+
+        worker = REPO_ROOT / "desktop_dictation" / "queue-worker.sh"
+        with (state_root / "dictation.log").open("ab") as worker_log:
+            # The launcher exits promptly; the detached worker survives a server
+            # shutdown so recordings can still queue while the model is offline.
+            subprocess.run(
+                [str(worker), "--background"],
+                stdin=subprocess.DEVNULL,
+                stdout=worker_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+                check=True,
+                timeout=2,
+            )
+        print(
+            f"Desktop dictation backlog: {len(pending)} completed recording(s); "
+            "waking the queue worker now (without waiting for retry backoff)."
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"WARNING: Could not resume desktop dictation queue: {exc}")
+
+
 @asynccontextmanager
 async def app_lifespan(application: FastAPI):
+    resume_desktop_dictation_queue()
     try:
         yield
     finally:
@@ -303,6 +392,7 @@ async def transcribe_raw(request: Request):
     preprocessing_result = None
     transcription_event: str | None = None
     inference_attempted = False
+    defer_separator = False
     outcome = "failed"
     timings = {
         "client_recording_duration_ms": client_timing_value(
@@ -445,8 +535,7 @@ async def transcribe_raw(request: Request):
             )
         else:
             transcription_event = f"Transcribed Raw ({app.state.runtime_config.backend}): '{converted_text}'"
-        outcome = "success"
-        return {
+        response = {
             "text": converted_text,
             "original_text": original_text,
             "backend": app.state.runtime_config.backend,
@@ -457,6 +546,14 @@ async def transcribe_raw(request: Request):
             "audio_preprocessing": preprocessing_result.as_dict(),
             "timings": timings,
         }
+        outcome = "success"
+        # Desktop events finish when the client reports the paste result.
+        defer_separator = (
+            bool(converted_text.strip())
+            and request.headers.get("x-client-delivery-report", "").strip().lower()
+            == "desktop"
+        )
+        return response
     except Exception as exc:
         if tmp_path is not None:
             failed_recovery_started = time.perf_counter()
@@ -491,10 +588,11 @@ async def transcribe_raw(request: Request):
             else "not-run"
         )
         timing_fields = format_timing_fields(outcome, timings, device=device)
+        separator = "" if defer_separator else "\n"
         if transcription_event is not None:
-            print(f"{transcription_event} | {timing_fields}\n")
+            print(f"{transcription_event} | {timing_fields}{separator}")
         else:
-            print(f"Transcription timing | {timing_fields}\n")
+            print(f"Transcription timing | {timing_fields}{separator}")
 
 
 @app.post("/client-event", include_in_schema=False)
@@ -509,12 +607,71 @@ async def desktop_delivery_report(request: Request):
     label = {
         "complete": "Delivery complete",
         "refused": "Delivery refused",
+        "failed": "Delivery failed",
     }.get(status, f"Delivery report received [{status}]")
+    separator = "\n" if status in {"complete", "refused", "failed"} else ""
     if details:
-        print(f"{label}: {details}")
+        print(f"{label}: {details}{separator}")
     else:
-        print(label)
+        print(f"{label}{separator}")
     return {"ok": True}
+
+
+class ServiceStartupError(RuntimeError):
+    pass
+
+
+@contextmanager
+def reserve_service_endpoint(host: str, port: int):
+    """Claim the endpoint before loading a model; hold it until server exit."""
+    with ExitStack() as resources:
+        try:
+            family = socket.AF_INET6 if ":" in host else socket.AF_INET
+            server_socket = resources.enter_context(socket.socket(family, socket.SOCK_STREAM))
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server_socket.bind((host, port))
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    raise ServiceStartupError(
+                        f"Cannot start Whisper: {host}:{port} is already in use. "
+                        "Whisper or another server is already listening there. "
+                        "No model was loaded; the existing server was left untouched."
+                    ) from exc
+                raise
+
+            bound_port = server_socket.getsockname()[1]
+            runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+            lock_dir = runtime_dir / f"assistant-whisper-{os.getuid()}"
+            lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_file = resources.enter_context(
+                (lock_dir / f"port-{bound_port}.lock").open("a+", encoding="ascii")
+            )
+            # SO_REUSEADDR allows simultaneous binds before listen(). The lock
+            # prevents both processes from loading models during that interval.
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                lock_file.seek(0)
+                owner = lock_file.read(32).strip()
+                owner_description = f" (PID {owner})" if owner.isdecimal() else ""
+                raise ServiceStartupError(
+                    f"Whisper is already starting or running on port {bound_port}"
+                    f"{owner_description}. No model was loaded; "
+                    "the existing server was left untouched."
+                ) from exc
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(f"{os.getpid()}\n")
+            lock_file.flush()
+        except OSError as exc:
+            raise ServiceStartupError(
+                f"Cannot reserve Whisper endpoint {host}:{port}: {exc}. No model was loaded."
+            ) from exc
+
+        # Do not listen until Uvicorn is ready, or unlink the lock file: close
+        # releases ownership even after a crash, and stale PID text is harmless.
+        yield server_socket
 
 
 def main() -> int:
@@ -524,12 +681,28 @@ def main() -> int:
     dictConfig(log_config)
 
     runtime_config = build_runtime_config(parse_args())
-    configure_app(runtime_config)
-    uvicorn.run(
-        app,
-        host=runtime_config.host,
-        port=runtime_config.port,
-        log_config=log_config,
-        access_log=runtime_config.http_access_log,
-    )
-    return 0
+    try:
+        with reserve_service_endpoint(runtime_config.host, runtime_config.port) as server_socket:
+            report_microphone_startup_status()
+            configure_app(runtime_config)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=runtime_config.host,
+                    port=runtime_config.port,
+                    log_config=log_config,
+                    access_log=runtime_config.http_access_log,
+                )
+            )
+            host = runtime_config.host
+            if ":" in host:
+                host = f"[{host}]"
+            print(
+                f"Starting HTTP server on http://{host}:{server_socket.getsockname()[1]} "
+                "(Press CTRL+C to quit)"
+            )
+            server.run(sockets=[server_socket])
+            return 0 if server.started else 1
+    except ServiceStartupError as exc:
+        print(f"WARNING: {exc}")
+        return 1

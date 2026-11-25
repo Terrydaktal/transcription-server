@@ -101,7 +101,7 @@ def colour_transcription_event(output: str) -> str:
 def service_log(*args, **kwargs) -> None:
     output = kwargs.get("sep", " ").join(str(arg) for arg in args)
     lowered = output.lower()
-    if output.startswith(("ERROR", "Failed")):
+    if output.startswith(("ERROR", "Failed", "Delivery failed")):
         level = logging.ERROR
         color_message = ansi(output, ANSI_RED)
     elif (

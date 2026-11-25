@@ -2,13 +2,14 @@ import io
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 import wave
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from starlette.requests import Request
 from uvicorn.logging import DefaultFormatter
@@ -21,12 +22,14 @@ from whisper_service import (
     GraniteSpeechTranscriber,
     ParakeetTranscriber,
     app,
+    app_lifespan,
     build_log_config,
     build_runtime_config,
     canonicalize_technical_text,
     colour_timing_fields,
     configure_shared_model_caches,
     default_model_for_backend,
+    desktop_delivery_report,
     first_nemo_transcription_text,
     format_audio_size,
     format_client_preparation,
@@ -35,10 +38,13 @@ from whisper_service import (
     load_whisper_hotwords,
     normalize_technical_text,
     parse_parakeet_channel_selector,
+    pipewire_microphone_sources,
     prepare_granite_audio,
     preserve_failed_request,
     preserve_keyword_casing,
     protect_technical_terms,
+    report_microphone_startup_status,
+    resume_desktop_dictation_queue,
     restore_technical_terms,
     transcribe_raw,
     write_recovery_copy,
@@ -59,6 +65,127 @@ class SharedModelCacheTests(unittest.TestCase):
 
             self.assertEqual(os.environ["HF_HOME"], "/custom/huggingface")
             self.assertEqual(os.environ["TORCH_HOME"], "/shared/cache/torch")
+
+
+class MicrophoneStartupStatusTests(unittest.TestCase):
+    @patch("whisper_service.shutil.which", return_value="/usr/bin/pactl")
+    @patch("whisper_service.subprocess.run")
+    def test_monitor_source_does_not_count_as_microphone(self, run, _which):
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "71\talsa_output.pci-0000_01_00.1.hdmi-stereo.monitor\t"
+                "PipeWire\ts32le 2ch 48000Hz\n"
+            ),
+        )
+
+        self.assertEqual(pipewire_microphone_sources(), ())
+
+    @patch("whisper_service.shutil.which", return_value="/usr/bin/pactl")
+    @patch("whisper_service.subprocess.run")
+    def test_real_capture_source_is_reported(self, run, _which):
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "70\talsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo\t"
+                "PipeWire\ts16le 2ch 48000Hz\n"
+            ),
+        )
+
+        self.assertEqual(
+            pipewire_microphone_sources(),
+            ("alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo",),
+        )
+
+    @patch("whisper_service.pipewire_microphone_sources", return_value=())
+    @patch("whisper_service.print")
+    def test_missing_microphone_logs_clear_warning(self, service_print, _sources):
+        report_microphone_startup_status()
+
+        message = service_print.call_args.args[0]
+        self.assertIn("WARNING: No microphone", message)
+        self.assertIn("Local '+' dictation", message)
+        self.assertIn("uploaded audio transcription is unaffected", message)
+
+
+class DesktopQueueStartupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state" / "assistant-desktop-dictation"
+        self.queue = self.state / "queue"
+        self.queue.mkdir(parents=True)
+        self.runtime = self.root / "runtime" / "assistant-desktop-dictation"
+        self.runtime.mkdir(parents=True)
+        env = patch.dict(
+            os.environ,
+            {
+                "XDG_STATE_HOME": str(self.root / "state"),
+                "XDG_RUNTIME_DIR": str(self.root / "runtime"),
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    @patch("whisper_service.subprocess.run")
+    def test_empty_queue_does_not_start_a_worker(self, run):
+        resume_desktop_dictation_queue()
+        run.assert_not_called()
+
+    @patch("whisper_service.print")
+    @patch("whisper_service.subprocess.run")
+    def test_backlog_starts_or_wakes_worker_and_is_not_deleted(self, run, service_print):
+        recording = self.queue / "recording-001.wav"
+        recording.write_bytes(b"fixture")
+        resume_desktop_dictation_queue()
+
+        command = run.call_args.args[0]
+        self.assertEqual(Path(command[0]).name, "queue-worker.sh")
+        self.assertEqual(command[1:], ["--background"])
+        self.assertTrue(run.call_args.kwargs["close_fds"])
+        self.assertTrue(run.call_args.kwargs["start_new_session"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 2)
+        self.assertIn("1 completed recording(s)", service_print.call_args.args[0])
+        self.assertTrue(recording.exists())
+
+    @patch("whisper_service.subprocess.run")
+    def test_only_active_audio_is_not_a_completed_backlog(self, run):
+        recording = self.queue / "recording-001.wav"
+        recording.write_bytes(b"fixture")
+        (self.runtime / "current-audio-path").write_text(str(recording))
+        resume_desktop_dictation_queue()
+        run.assert_not_called()
+        self.assertTrue(recording.exists())
+
+    @patch("whisper_service.print")
+    @patch("whisper_service.subprocess.run", side_effect=OSError("cannot launch"))
+    def test_failed_worker_launch_warns_without_failing_server_startup(self, _run, service_print):
+        (self.queue / "recording-001.wav").write_bytes(b"fixture")
+        resume_desktop_dictation_queue()
+        self.assertIn("WARNING: Could not resume", service_print.call_args.args[0])
+
+    @patch("whisper_service.print")
+    @patch("whisper_service.subprocess.run", side_effect=subprocess.TimeoutExpired("worker", 2))
+    def test_launch_timeout_warns_and_preserves_backlog(self, _run, service_print):
+        recording = self.queue / "recording-001.wav"
+        recording.write_bytes(b"fixture")
+        resume_desktop_dictation_queue()
+        self.assertTrue(recording.exists())
+        self.assertIn("WARNING: Could not resume", service_print.call_args.args[0])
+
+
+class DesktopQueueLifespanTests(unittest.IsolatedAsyncioTestCase):
+    @patch("whisper_service.resume_desktop_dictation_queue")
+    async def test_lifespan_resumes_queue_and_closes_model_even_on_error(self, resume):
+        model = Mock()
+        application = SimpleNamespace(state=SimpleNamespace(transcriber=model))
+        with self.assertRaisesRegex(RuntimeError, "fixture"):
+            async with app_lifespan(application):
+                resume.assert_called_once_with()
+                model.close.assert_not_called()
+                raise RuntimeError("fixture")
+        model.close.assert_called_once_with()
 
 
 class FasterWhisperBatchingTests(unittest.TestCase):
@@ -814,6 +941,9 @@ class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
         fail=False,
         colour=False,
         body=b"audio",
+        desktop=False,
+        text="Test transcript.",
+        delivery_payload=None,
     ):
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
@@ -821,7 +951,7 @@ class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
         request = Request(
             {
                 "type": "http",
-                "headers": [],
+                "headers": [(b"x-client-delivery-report", b"desktop")] if desktop else [],
                 "client": ("127.0.0.1", 1234),
             },
             receive=receive,
@@ -831,7 +961,7 @@ class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
             last_inference_used_cpu_fallback=fallback,
             transcribe_file=Mock(
                 side_effect=RuntimeError("fixture failure") if fail else None,
-                return_value="Test transcript.",
+                return_value=text,
             ),
         )
         prepared = SimpleNamespace(
@@ -868,6 +998,10 @@ class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
             patch("assistant_transcription.log_output.service_logger", logger),
         ):
             response = await transcribe_raw(request)
+            if delivery_payload is not None:
+                await desktop_delivery_report(
+                    SimpleNamespace(json=AsyncMock(return_value=delivery_payload))
+                )
         return response, stream.getvalue(), transcriber
 
     async def test_result_device_and_blank_separator_survive_console_formatting(self):
@@ -900,6 +1034,74 @@ class TranscriptionLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         transcriber.transcribe_file.assert_not_called()
         self.assertIn("outcome=failed device=not-run", output)
+        self.assertTrue(output.endswith("\n\n"))
+
+    async def test_desktop_result_defers_blank_separator_until_delivery(self):
+        for colour in (False, True):
+            with self.subTest(colour=colour):
+                response, output, _ = await self.render_request(
+                    device="cuda", desktop=True, colour=colour,
+                )
+                plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+                self.assertEqual(response["text"], "Test transcript.")
+                self.assertIn("outcome=success device=GPU", plain)
+                self.assertTrue(plain.endswith("\n"))
+                self.assertNotIn("\n\n", plain)
+
+    async def test_desktop_terminal_reports_close_event_after_delivery(self):
+        details = (
+            "total_ms=668 (client_stop_to_upload_ms=106 + "
+            "client_network_and_delivery_overhead_ms=5 + "
+            "server_total_ms=391 + client_paste_ms=166)"
+        )
+        for status in ("complete", "refused", "failed"):
+            for colour in (False, True):
+                with self.subTest(status=status, colour=colour):
+                    _, output, _ = await self.render_request(
+                        device="cuda", desktop=True, colour=colour,
+                        delivery_payload={"status": status, "details": details},
+                    )
+                    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+                    self.assertIn(f"Client: Delivery {status}: {details}", plain)
+                    self.assertLess(
+                        plain.index("Server: Transcribed Raw"),
+                        plain.index(f"Client: Delivery {status}"),
+                    )
+                    self.assertTrue(plain.endswith("\n\n"), repr(plain))
+                    self.assertEqual(plain.count("\n\n"), 1)
+
+    async def test_legacy_report_without_details_still_closes_desktop_event(self):
+        _, output, _ = await self.render_request(
+            device="cuda", desktop=True,
+            delivery_payload={"event": "desktop-delivery-complete"},
+        )
+        self.assertTrue(output.endswith("Client: Delivery complete\n\n"))
+        self.assertEqual(output.count("\n\n"), 1)
+
+    async def test_desktop_empty_transcript_closes_without_delivery_report(self):
+        for text in ("", " \t "):
+            with self.subTest(text=text):
+                response, output, _ = await self.render_request(
+                    device="cuda", desktop=True, text=text,
+                )
+                self.assertEqual(response["text"], text)
+                self.assertIn("outcome=success device=GPU", output)
+                self.assertTrue(output.endswith("\n\n"))
+
+    async def test_desktop_failed_transcription_closes_without_delivery_report(self):
+        response, output, _ = await self.render_request(
+            device="cuda", desktop=True, fail=True,
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("outcome=failed device=GPU", output)
+        self.assertTrue(output.endswith("\n\n"))
+
+    async def test_desktop_rejected_upload_closes_without_delivery_report(self):
+        response, output, transcriber = await self.render_request(
+            device="cuda", desktop=True, body=b"",
+        )
+        self.assertEqual(response.status_code, 400)
+        transcriber.transcribe_file.assert_not_called()
         self.assertTrue(output.endswith("\n\n"))
 
 
