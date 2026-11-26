@@ -12,6 +12,7 @@ The [transcription experiment catalogue](docs/asr-experiments.md) records the mo
 transcription-server/
 ├── pyproject.toml, uv.lock              # uv environment and CUDA/ASR extras
 ├── whisper_service.py                   # Compatibility launcher (delegates to assistant_transcription.server)
+├── deploy-ai                            # Publish committed main revisions to the ai ROCm systemd service
 ├── transcription_consensus.py           # Symlink to src/assistant_transcription/consensus/merge.py for benchmarks
 ├── src/assistant_transcription/
 │   ├── server.py                        # FastAPI /transcribe_raw, /transcribe_segments, /health & startup lock
@@ -32,6 +33,7 @@ transcription-server/
 ├── docs/                                # Benchmark results, consensus study & noisy-ASR notes
 └── tests/
     ├── test_audio_preprocessing.py
+    ├── test_deploy_ai.py
     ├── test_transcribe_segments.py
     ├── test_transcription_consensus.py
     ├── test_whisper_service.py
@@ -72,6 +74,57 @@ UV_CACHE_DIR=/data/.cache/uv uv run python whisper_service.py
 ```
 - **Long-audio batching:** Recordings ≥ 60 s automatically use `faster-whisper`’s batched GPU pipeline at accuracy-validated batch size `2`. Batch size `4` (`--long-audio-batch-size 4` / `WHISPER_LONG_AUDIO_BATCH_SIZE=4`) reduces long-file runtime ~24% (~4,924 MiB peak on RTX 5060) at a slight accuracy trade-off. Configure threshold with `--batch-threshold-seconds` (`WHISPER_BATCH_THRESHOLD_SECONDS`); batch size `1` disables batching. Failed batched runs retry with standard GPU transcription before falling back to cached CPU on CUDA OOM.
 - **Hotwords & beam controls:** Optional `--hotwords` / `--hotwords-file` (`WHISPER_HOTWORDS` / `WHISPER_HOTWORDS_FILE`, disabled by default — keep narrowly scoped because broader lists hurt technical WER) and `--patience` / `--length-penalty` (`WHISPER_PATIENCE` / `WHISPER_LENGTH_PENALTY`, validated defaults `1.0`).
+
+#### AMD ROCm with an existing Whisper wheel
+
+Use a separate Python environment and a CTranslate2 ROCm wheel that has been
+tested on the GPU. Export the locked HTTP and model dependencies without the
+NVIDIA libraries or the default CTranslate2 wheel:
+
+```bash
+export UV_CACHE_DIR=/data/.cache/uv
+rocm_wheel=/path/to/ctranslate2-rocm-wheel.whl  # Use the wheel's original filename.
+rocm_python=3.12                              # Match the wheel's Python ABI.
+rocm_env=.venv-rocm
+uv venv --python "$rocm_python" "$rocm_env"
+uv export --locked --no-dev --no-hashes --no-emit-project \
+  --no-emit-package ctranslate2 --no-emit-package nvidia-cublas-cu12 \
+  --no-emit-package nvidia-cudnn-cu12 --output-file "$rocm_env/requirements.txt"
+uv pip install --python "$rocm_env/bin/python" \
+  -r "$rocm_env/requirements.txt" "$rocm_wheel"
+uv pip check --python "$rocm_env/bin/python"
+```
+
+Launch with the library path and model cache from the working ROCm runtime.
+HIP-enabled CTranslate2 exposes the AMD GPU through its `cuda` device name.
+
+```bash
+PYTHONPATH="$PWD/src" "$rocm_env/bin/python" whisper_service.py \
+  --host 127.0.0.1 --port 5001 --backend faster-whisper \
+  --model large-v3 --device cuda --compute-type float16
+```
+
+#### Deploy to `ai`
+
+After pushing the server changes to `origin/main`, run:
+
+```bash
+./deploy-ai --check    # Check the published source and installed ROCm profile.
+./deploy-ai            # Deploy and restart the managed service if it is running.
+./deploy-ai --start    # Deploy and start a stopped service when the GPU is available.
+```
+
+`deploy-ai` transfers the exact published commit over SSH and uses the existing
+ROCm environment on `ai`. It stages releases by SHA, waits for the running server
+to become idle, and checks the new SHA in `/health` after restarting. Failed starts
+or health checks restore the previous release. A changed dependency lock requires
+refreshing the separate ROCm environment and its exported `requirements.txt`
+before rolling out. Normal deploys stage stopped services for their next start.
+
+The command creates the user unit `transcription-server-rocm.service`, listening
+on `127.0.0.1:5001`. Stop any manual server on that port before using the managed
+service. Check it with `ssh ai 'systemctl --user status transcription-server-rocm.service'`
+or verify the revision with `ssh ai 'curl -fsS http://127.0.0.1:5001/health'`.
 
 ### 2. Parakeet TDT 0.6B v2
 ```sh

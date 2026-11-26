@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Publish a committed transcription server release to the existing ai ROCm runtime."""
+
+import argparse
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+
+ROOT = "/mnt/ai-nvme/qwen-radiance-public-clean-snapshot-v1/transcription-server-rocm"
+UNIT = "transcription-server-rocm.service"
+PORT = 5001
+HEALTH = f"http://127.0.0.1:{PORT}/health"
+ARCHIVE_PATHS = ("deploy-ai", "whisper_service.py", "pyproject.toml", "uv.lock", "src")
+UV_EXPORT = (
+    "uv", "export", "--locked", "--no-dev", "--no-hashes", "--no-annotate",
+    "--no-header", "--no-emit-project", "--no-emit-package", "ctranslate2",
+    "--no-emit-package", "nvidia-cublas-cu12", "--no-emit-package", "nvidia-cudnn-cu12",
+)
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def git(repo, *args):
+    return run("git", "-C", str(repo), *args, stdout=subprocess.PIPE).stdout
+
+
+def remote_main(repo):
+    ref = git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/main")
+    revision = ref.decode().split()[0]
+    try:
+        git(repo, "cat-file", "-e", f"{revision}^{{commit}}")
+    except subprocess.CalledProcessError:
+        git(repo, "fetch", "--no-tags", "origin", revision)
+    return revision
+
+
+def runtime_environment(root, source):
+    benchmark = root.parent / "asr-benchmark-20261109"
+    libraries = [
+        benchmark / "production-whisper-runtime/lib",
+        benchmark / "runtime/.venv/lib/python3.14/site-packages/torch/lib",
+        Path("/opt/rocm/lib"),
+    ]
+    env = os.environ.copy()
+    for path in libraries:
+        if not path.is_dir():
+            raise RuntimeError(f"ROCm runtime library directory is missing: {path}")
+    cache = benchmark / "cache/huggingface"
+    if not cache.is_dir():
+        raise RuntimeError(f"ROCm model cache is missing: {cache}")
+    env.update(
+        LD_LIBRARY_PATH=os.pathsep.join(
+            [str(path) for path in libraries] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        ),
+        HF_HOME=str(cache),
+        HF_HUB_OFFLINE="1",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONUNBUFFERED="1",
+        PYTHONPATH=str(source / "src"),
+    )
+    for name, default in (("OMP_NUM_THREADS", "8"), ("OPENBLAS_NUM_THREADS", "4")):
+        env.setdefault(name, default)
+    return env
+
+
+def verify_release(root, source):
+    python = root / "env/.venv/bin/python"
+    if not python.is_file():
+        raise RuntimeError(f"Install the validated ROCm environment first: {python}")
+    env = runtime_environment(root, source)
+    env["UV_CACHE_DIR"] = "/data/.cache/uv"
+    requirements = run(*UV_EXPORT, cwd=source, env=env, stdout=subprocess.PIPE).stdout
+    if requirements.splitlines() != (root / "requirements.txt").read_bytes().splitlines():
+        raise RuntimeError(
+            "Locked dependencies differ from the installed ROCm profile. "
+            "Refresh that profile using the AMD ROCm steps in README.md before deploying this revision."
+        )
+    run("uv", "pip", "check", "--python", str(python), env=env)
+    env["TRANSCRIPTION_SERVER_REVISION"] = "preflight"
+    run(str(python), "-c", """
+import asyncio
+import ctranslate2
+import uvicorn
+from assistant_transcription.server import app, health
+if ctranslate2.__version__ != '4.8.5':
+    raise SystemExit('Expected the validated CTranslate2 4.8.5 ROCm wheel')
+expected = {'/health', '/transcribe_raw', '/transcribe_segments'}
+if not expected.issubset(app.openapi()['paths']):
+    raise SystemExit('Revision lacks the deployment-aware transcription API')
+status = asyncio.run(health())
+if status.get('revision') != 'preflight' or status.get('active_transcriptions') != 0:
+    raise SystemExit('Revision lacks deployment health metadata')
+""", env=env)
+
+
+def systemctl(*args):
+    run("systemctl", "--user", *args)
+
+
+def is_active():
+    return subprocess.run(
+        ("systemctl", "--user", "is-active", "--quiet", UNIT), check=False,
+    ).returncode == 0
+
+
+def port_in_use():
+    try:
+        with socket.create_connection(("127.0.0.1", PORT), timeout=1):
+            return True
+    except ConnectionRefusedError:
+        return False
+
+
+def health_status():
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(HEALTH, timeout=2) as response:
+        return json.load(response)
+
+
+def wait_ready(revision, seconds, *, idle=False):
+    deadline = time.monotonic() + seconds
+    last_status = None
+    while True:
+        try:
+            health = health_status()
+            ready = health.get("ok") and health.get("loaded") and health.get("revision") == revision
+            quiet = (
+                health.get("active_transcriptions") == 0
+                and health.get("gpu_busy") is False and health.get("gpu_waiters") == 0
+            )
+            if ready and (quiet or not idle):
+                return
+            last_status = f"revision={health.get('revision')}, active={health.get('active_transcriptions')}"
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            last_status = str(exc)
+        if time.monotonic() >= deadline:
+            target = "idle" if idle else "healthy"
+            raise RuntimeError(f"Server did not become {target} at {revision}: {last_status}")
+        time.sleep(1)
+
+
+def install_unit(root):
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    target = config / "systemd/user" / UNIT
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def quote_unit_arg(value):
+        return json.dumps(str(value).replace("%", "%%").replace("$", "$$"), ensure_ascii=False)
+
+    code = quote_unit_arg(root / "current/deploy-ai")
+    directory = quote_unit_arg(root)
+    service = (
+        "[Unit]\nDescription=Local transcription server (AMD ROCm)\n\n"
+        "[Service]\nType=simple\n"
+        f"ExecStart=/usr/bin/env python3 {code} --serve {directory}\n"
+        "KillMode=mixed\nTimeoutStopSec=600\nUMask=0077\n\n"
+        "[Install]\nWantedBy=default.target\n"
+    )
+    if target.exists() and target.read_text() != service:
+        raise RuntimeError(f"Existing unit differs from the deploy-managed unit: {target}")
+    if not target.exists():
+        with target.open("x", encoding="utf-8") as stream:
+            stream.write(service)
+    systemctl("daemon-reload")
+
+
+def point_current(root, release):
+    current = root / "current"
+    if release is None:
+        current.unlink(missing_ok=True)
+        return
+    pending = root / f".current-{os.getpid()}"
+    try:
+        pending.symlink_to(release.relative_to(root))
+        pending.replace(current)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def activate(root, release, start, seconds):
+    current = root / "current"
+    if current.exists() and not current.is_symlink():
+        raise RuntimeError(f"Expected a deployment symlink at {current}")
+    previous = current.resolve(strict=True) if current.is_symlink() else None
+    if previous is not None and previous.parent != root / "releases":
+        raise RuntimeError(f"Current release is outside the managed releases directory: {previous}")
+    active = is_active()
+    if active and previous is None:
+        raise RuntimeError("The service is active without a managed current release")
+    if not active and port_in_use():
+        raise RuntimeError(f"An unmanaged server is already listening on port {PORT}")
+    if active and previous == release:
+        wait_ready(release.name, seconds)
+        print(f"Already running {release.name}", flush=True)
+        return
+    if active:
+        print(f"Waiting for {previous.name} to be idle...", flush=True)
+        wait_ready(previous.name, seconds, idle=True)
+
+    install_unit(root)
+    point_current(root, release)
+    if not active and not start:
+        print(f"Prepared {release.name} for the next start. Start with systemctl --user start {UNIT}.", flush=True)
+        return
+    try:
+        systemctl("restart" if active else "start", UNIT)
+        wait_ready(release.name, seconds)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        try:
+            point_current(root, previous)
+            if active:
+                systemctl("restart", UNIT)
+                wait_ready(previous.name, seconds)
+            else:
+                systemctl("stop", UNIT)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as rollback_error:
+            raise RuntimeError(
+                f"Release {release.name} failed: {exc}. Rollback failed: {rollback_error}"
+            ) from rollback_error
+        raise RuntimeError(f"Release {release.name} failed and the previous selection was restored: {exc}") from exc
+    print(f"Serving {release.name} on {HEALTH.removesuffix('/health')}", flush=True)
+
+
+def publish(root, revision, archive, check, start, seconds):
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+        raise RuntimeError("Expected an exact Git commit SHA")
+    os.umask(0o077)
+    root = root.resolve(strict=True)
+    with (root / "deploy.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with tempfile.TemporaryDirectory(prefix=".candidate-", dir=root) as folder:
+            source = Path(folder) / "source"
+            source.mkdir()
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+                if tar.pax_headers.get("comment") != revision:
+                    raise RuntimeError("Git archive does not match the requested revision")
+                tar.extractall(source, filter="data")
+            verify_release(root, source)
+            if check:
+                print(f"Checked {revision}; ready for deployment.", flush=True)
+                return
+            release = root / "releases" / revision
+            release.parent.mkdir(exist_ok=True)
+            digest = hashlib.sha256(archive).hexdigest()
+            if release.exists():
+                if (release / ".archive-sha256").read_text().strip() != digest:
+                    raise RuntimeError(f"Existing release differs from the published archive: {release}")
+            else:
+                (source / ".archive-sha256").write_text(digest + "\n")
+                source.rename(release)
+        activate(root, release, start, seconds)
+
+
+def serve(root):
+    source = (root / "current").resolve(strict=True)
+    python = str(root / "env/.venv/bin/python")
+    env = runtime_environment(root, source)
+    env["TRANSCRIPTION_SERVER_REVISION"] = source.name
+    os.execve(python, [
+        python, str(source / "whisper_service.py"), "--host", "127.0.0.1", "--port", str(PORT),
+        "--backend", "faster-whisper", "--model", "large-v3", "--device", "cuda",
+        "--compute-type", "float16", "--recovery-dir", str(root / "recovery"),
+    ], env)
+
+
+def main():
+    if sys.argv[1:2] == ["--serve"]:
+        serve(Path(sys.argv[2]))
+        return
+    if sys.argv[1:2] == ["--publish"]:
+        _, root, revision, check, start, seconds = sys.argv[1:]
+        publish(Path(root), revision, sys.stdin.buffer.read(), check == "1", start == "1", int(seconds))
+        return
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="ai", help="SSH host or alias (default: ai)")
+    parser.add_argument("--root", default=ROOT, help="existing ROCm runtime directory on the SSH host")
+    parser.add_argument("--check", action="store_true", help="verify the release without switching the running code")
+    parser.add_argument("--start", action="store_true", help="start the managed server if it is stopped")
+    parser.add_argument("--wait-seconds", type=int, default=120, help="seconds to wait for idle and healthy status")
+    args = parser.parse_args()
+    if args.wait_seconds < 1 or (args.check and args.start):
+        parser.error("set a positive wait and choose at most one of --check and --start")
+    if not args.host or args.host.startswith("-"):
+        parser.error("--host must be an SSH destination")
+
+    script = Path(__file__).resolve()
+    repo = script.parent
+    revision = remote_main(repo)
+    try:
+        archive = git(repo, "archive", "--format=tar", revision, *ARCHIVE_PATHS)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"origin/main ({revision}) does not contain the deployable server yet") from exc
+    remote = shlex.join([
+        "python3", "-c", script.read_text(), "--publish", args.root, revision,
+        str(int(args.check)), str(int(args.start)), str(args.wait_seconds),
+    ])
+    print(f"Using origin/main at {revision} on {args.host}", flush=True)
+    try:
+        run("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", args.host, remote, input=archive)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Deploy on {args.host} exited with status {exc.returncode}") from exc
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as error:
+        sys.exit(f"Deployment failed: {error}")
