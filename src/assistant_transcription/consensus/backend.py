@@ -252,6 +252,7 @@ class AdaptiveConsensusTranscriber(ConsensusTranscriber):
         )
 
     def transcribe_file(self, audio_path: str) -> str:
+        self.last_segment_metadata: list[dict[str, object]] = []
         whisper_payload = self._run_project_worker_payload(
             "faster-whisper",
             audio_path,
@@ -281,6 +282,7 @@ class AdaptiveConsensusTranscriber(ConsensusTranscriber):
 
         if not regions:
             print("Adaptive consensus skipped Cohere: first two voters agree.")
+            self.last_segment_metadata = segments
             return whisper_text
 
         covered_seconds = sum(region.end - region.start for region in regions)

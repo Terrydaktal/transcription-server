@@ -14,7 +14,9 @@ transcription-server/
 ├── whisper_service.py                   # Compatibility launcher (delegates to assistant_transcription.server)
 ├── transcription_consensus.py           # Symlink to src/assistant_transcription/consensus/merge.py for benchmarks
 ├── src/assistant_transcription/
-│   ├── server.py                        # FastAPI /transcribe_raw server, startup lock & desktop queue wakeup
+│   ├── server.py                        # FastAPI /transcribe_raw, /transcribe_segments, /health & startup lock
+│   ├── priority_lock.py                 # 2-tier async priority GPU lock (live dictation > batch segments)
+│   ├── segments.py                      # Cross-backend timestamped segment transcription & Silero VAD fallback
 │   ├── config.py                        # CLI flags, env vars, defaults & backend presets
 │   ├── paths.py                         # Repo/service root resolution
 │   ├── environment.py                   # Cache/device environment setup
@@ -30,6 +32,7 @@ transcription-server/
 ├── docs/                                # Benchmark results, consensus study & noisy-ASR notes
 └── tests/
     ├── test_audio_preprocessing.py
+    ├── test_transcribe_segments.py
     ├── test_transcription_consensus.py
     ├── test_whisper_service.py
     └── test_whisper_startup.py
@@ -39,8 +42,9 @@ transcription-server/
 
 ## Inputs, Outputs & Pipeline Behavior
 
-- **Input:** `POST /transcribe_raw` with binary audio payload (WAV, FLAC, or ffmpeg-decodable audio). Optional `X-Client-Recording-Duration-Ms` header for end-to-end timing logs.
-- **Output:** JSON `{"text": "...", "backend": "...", "model": "..."}` plus preprocessing/filter decision metadata and variant-conversion metadata when enabled.
+- **Input (`POST /transcribe_raw`):** binary audio payload (WAV, FLAC, or ffmpeg-decodable audio) for real-time dictation. Optional `X-Client-Recording-Duration-Ms` header for end-to-end timing logs. Runs at **high GPU priority** (`PRIORITY_LIVE_DICTATION`).
+- **Batch segment endpoint (`POST /transcribe_segments` + `GET /health`):** stateless low-priority GPU endpoint (`PRIORITY_BATCH_SEGMENTS`) for batch/long-recording clients like [`diarise`](https://github.com/Terrydaktal/diarise) (`./diarise ... --server http://127.0.0.1:5001` or over an SSH tunnel to a remote AI GPU). Accepts raw audio bytes + query params/`X-Transcribe-Options` JSON header or a framed binary envelope (`application/vnd.assistant-transcription.envelope`), skips `.transcription_recovery` and dictation post-processing by default, and returns `{"segments": [{"start", "end", "text"}], "language": ..., "timestamp_source": ...}`. Live `/transcribe_raw` dictation automatically preempts queued `/transcribe_segments` windows.
+- **Output (`/transcribe_raw`):** JSON `{"text": "...", "backend": "...", "model": "..."}` plus preprocessing/filter decision metadata and variant-conversion metadata when enabled.
 - **Conditional source cleanup (`preprocessing.py`):** Enabled by default. Measures active-frame sub-60 Hz energy and DC offset before transcription. If low-frequency energy is sufficiently strong and either its ratio or the DC-offset trigger is exceeded, creates a temporary 80 Hz high-pass WAV via system `ffmpeg`; otherwise the original upload is used unchanged. Original audio is always retained for recovery, filtering fails open (reporting any `ffmpeg` error in logs and response), and `audio_preprocess_ms`, `filter_applied`, trigger reason, low-frequency ratio/level, and DC offset are logged for every request.
   - Disable with `--no-low-frequency-filter` or `WHISPER_LOW_FREQUENCY_FILTER=false`.
   - Tune thresholds with `--low-frequency-filter-cutoff-hz` (`WHISPER_LOW_FREQUENCY_FILTER_CUTOFF_HZ`), `--low-frequency-filter-ratio-threshold` (`WHISPER_LOW_FREQUENCY_FILTER_RATIO_THRESHOLD`), `--low-frequency-filter-absolute-dbfs` (`WHISPER_LOW_FREQUENCY_FILTER_ABSOLUTE_DBFS`), and `--low-frequency-filter-dc-offset-threshold` (`WHISPER_LOW_FREQUENCY_FILTER_DC_OFFSET_THRESHOLD`).

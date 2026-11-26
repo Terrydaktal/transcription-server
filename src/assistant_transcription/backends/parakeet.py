@@ -102,6 +102,7 @@ class ParakeetTranscriber:
         print("Parakeet TDT model loaded successfully.")
 
     def transcribe_file(self, audio_path: str) -> str:
+        self.last_segment_metadata = []
         try:
             if self.preset.vad_threshold is not None:
                 text = self._transcribe_with_vad(audio_path)
@@ -361,6 +362,8 @@ class ParakeetTranscriber:
             audio.shape[-1],
         )
         transcripts = []
+        segment_metadata: list[dict[str, object]] = []
+        sample_rate = float(self.preset.sample_rate)
         for start, end, overlaps_previous in segment_ranges:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as segment_file:
                 segment_path = segment_file.name
@@ -369,10 +372,18 @@ class ParakeetTranscriber:
                 text = self._transcribe_one_file(segment_path)
                 if text:
                     transcripts.append((text, overlaps_previous))
+                    segment_metadata.append(
+                        {
+                            "start": round(start / sample_rate, 3),
+                            "end": round(end / sample_rate, 3),
+                            "text": text,
+                        }
+                    )
             finally:
                 if os.path.exists(segment_path):
                     os.remove(segment_path)
 
+        self.last_segment_metadata = segment_metadata
         print(
             f"Parakeet VAD segmented audio: natural_segments={len(timestamps)} "
             f"inference_segments={len(segment_ranges)} "

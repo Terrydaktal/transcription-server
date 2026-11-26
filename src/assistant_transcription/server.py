@@ -1,20 +1,30 @@
+import asyncio
 import errno
 import fcntl
+import json
 import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from logging.config import dictConfig
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import log_output
+from .priority_lock import (
+    PRIORITY_BATCH_SEGMENTS,
+    PRIORITY_LIVE_DICTATION,
+    AsyncPriorityLock,
+)
+from .segments import SegmentTranscriptionResult, transcribe_with_segments
 # Explicit re-exports support existing imports through the root whisper_service module.
 from .backends import (
     AdaptiveConsensusTranscriber as AdaptiveConsensusTranscriber,
@@ -163,6 +173,18 @@ app = FastAPI(title="Local Transcription Server", lifespan=app_lifespan)
 app.state.runtime_config = None
 app.state.transcriber = None
 app.state.variant_post_processor = None
+app.state.active_transcriptions = 0
+
+
+@app.middleware("http")
+async def track_transcriptions(request: Request, call_next):
+    if request.method != "POST" or request.url.path not in {"/transcribe_raw", "/transcribe_segments"}:
+        return await call_next(request)
+    app.state.active_transcriptions += 1
+    try:
+        return await call_next(request)
+    finally:
+        app.state.active_transcriptions -= 1
 
 
 def recovery_dir_path() -> Path:
@@ -277,6 +299,14 @@ def configure_app(config: RuntimeConfig) -> None:
         if config.variant_conversion_enabled
         else None
     )
+
+
+def get_gpu_lock() -> AsyncPriorityLock:
+    lock = getattr(app.state, "gpu_lock", None)
+    if lock is None:
+        lock = AsyncPriorityLock()
+        app.state.gpu_lock = lock
+    return lock
 
 
 def ensure_transcriber_loaded() -> None:
@@ -514,10 +544,12 @@ async def transcribe_raw(request: Request):
             )
 
             transcribe_started = time.perf_counter()
-            inference_attempted = True
-            original_text = app.state.transcriber.transcribe_file(
-                preprocessing_result.transcription_path
-            )
+            async with get_gpu_lock().hold(priority=PRIORITY_LIVE_DICTATION):
+                inference_attempted = True
+                original_text = await asyncio.to_thread(
+                    app.state.transcriber.transcribe_file,
+                    preprocessing_result.transcription_path,
+                )
             timings["server_transcribe_ms"] = round(
                 (time.perf_counter() - transcribe_started) * 1000
             )
@@ -601,6 +633,245 @@ async def transcribe_raw(request: Request):
             print(f"{transcription_event} | {timing_fields}{separator}")
         else:
             print(f"Transcription timing | {timing_fields}{separator}")
+
+
+SEGMENTS_ENVELOPE_MIME = "application/vnd.assistant-transcription.envelope"
+MAX_ENVELOPE_HEADER_BYTES = 16 * 1024 * 1024
+
+
+def _parse_bool_param(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    lowered = raw.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean option: {raw!r}")
+
+
+def _extract_segment_options_from_request(request: Request) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    header_json = request.headers.get("x-transcribe-options")
+    if header_json:
+        parsed = json.loads(header_json)
+        if not isinstance(parsed, dict):
+            raise ValueError("X-Transcribe-Options must be a JSON object.")
+        options.update(parsed)
+
+    query = request.query_params
+    for str_key in ("language", "task", "initial_prompt", "hotwords"):
+        if str_key in query:
+            options[str_key] = query[str_key]
+    for int_key in (
+        "beam_size",
+        "vad_min_silence_ms",
+        "vad_speech_pad_ms",
+        "chunk_length",
+        "batch_size",
+    ):
+        if int_key in query:
+            options[int_key] = int(query[int_key])
+    for float_key in (
+        "patience",
+        "length_penalty",
+        "vad_threshold",
+        "log_prob_threshold",
+        "no_speech_threshold",
+        "compression_ratio_threshold",
+        "hallucination_silence_threshold",
+    ):
+        if float_key in query:
+            options[float_key] = float(query[float_key])
+    for bool_key in ("vad_filter", "batched", "postprocess"):
+        if bool_key in query:
+            options[bool_key] = _parse_bool_param(query[bool_key])
+    return options
+
+
+@app.get("/health")
+async def health():
+    config = getattr(app.state, "runtime_config", None)
+    transcriber = getattr(app.state, "transcriber", None)
+    lock = get_gpu_lock()
+    return {
+        "ok": True,
+        "backend": getattr(config, "backend", None),
+        "model": getattr(config, "model_name", None),
+        "device": format_transcription_device(transcriber) if transcriber else None,
+        "loaded": transcriber is not None,
+        "revision": os.environ.get("TRANSCRIPTION_SERVER_REVISION"),
+        "active_transcriptions": app.state.active_transcriptions,
+        "gpu_busy": lock.locked,
+        "gpu_waiters": lock.pending_count,
+        "endpoints": ["/health", "/transcribe_raw", "/transcribe_segments"],
+    }
+
+
+@app.post("/transcribe_segments")
+async def transcribe_segments(request: Request):
+    """Low-priority timestamped segment transcription for batch clients (e.g. diarise).
+
+    Accepts either:
+    - Raw audio bytes in the body + optional X-Transcribe-Options JSON header / query params
+    - Framed binary envelope (Content-Type: application/vnd.assistant-transcription.envelope):
+      4-byte big-endian uint32 JSON header length + UTF-8 JSON options + raw audio bytes
+    """
+    request_started = time.perf_counter()
+    tmp_path: str | None = None
+    timings = {
+        "transcriber_ready_ms": -1,
+        "upload_body_read_ms": -1,
+        "queue_wait_ms": -1,
+        "server_transcribe_ms": -1,
+        "server_total_ms": -1,
+        "audio_bytes": 0,
+    }
+    try:
+        try:
+            options = _extract_segment_options_from_request(request)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid transcription options: {exc}", "timings": timings},
+            )
+
+        transcriber_started = time.perf_counter()
+        ensure_transcriber_loaded()
+        timings["transcriber_ready_ms"] = round(
+            (time.perf_counter() - transcriber_started) * 1000
+        )
+
+        content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        is_envelope = content_type == SEGMENTS_ENVELOPE_MIME
+
+        body_read_started = time.perf_counter()
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+            tmp_path = tmp.name
+            if is_envelope:
+                prefix = bytearray()
+                header_len: int | None = None
+                header_done = False
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    if header_done:
+                        tmp.write(chunk)
+                        timings["audio_bytes"] += len(chunk)
+                        continue
+                    prefix.extend(chunk)
+                    if header_len is None and len(prefix) >= 4:
+                        header_len = struct.unpack(">I", prefix[:4])[0]
+                        if header_len > MAX_ENVELOPE_HEADER_BYTES:
+                            return JSONResponse(
+                                status_code=400,
+                                content={
+                                    "error": f"Envelope JSON header exceeds limit ({header_len} bytes).",
+                                    "timings": timings,
+                                },
+                            )
+                    if header_len is not None and len(prefix) >= 4 + header_len:
+                        header_bytes = bytes(prefix[4 : 4 + header_len])
+                        remainder = bytes(prefix[4 + header_len :])
+                        try:
+                            env_opts = json.loads(header_bytes.decode("utf-8"))
+                            if not isinstance(env_opts, dict):
+                                raise ValueError("Envelope options must be a JSON object.")
+                        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                            return JSONResponse(
+                                status_code=400,
+                                content={
+                                    "error": f"Invalid envelope header JSON: {exc}",
+                                    "timings": timings,
+                                },
+                            )
+                        options.update(env_opts)
+                        header_done = True
+                        if remainder:
+                            tmp.write(remainder)
+                            timings["audio_bytes"] += len(remainder)
+                if not header_done:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "Truncated envelope request body.", "timings": timings},
+                    )
+            else:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    tmp.write(chunk)
+                    timings["audio_bytes"] += len(chunk)
+        timings["upload_body_read_ms"] = round(
+            (time.perf_counter() - body_read_started) * 1000
+        )
+
+        if timings["audio_bytes"] == 0:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Empty request body.", "timings": timings},
+            )
+
+        queue_started = time.perf_counter()
+        async with get_gpu_lock().hold(priority=PRIORITY_BATCH_SEGMENTS):
+            timings["queue_wait_ms"] = round((time.perf_counter() - queue_started) * 1000)
+            transcribe_started = time.perf_counter()
+            result: SegmentTranscriptionResult = await asyncio.to_thread(
+                transcribe_with_segments,
+                app.state.transcriber,
+                tmp_path,
+                options,
+            )
+            timings["server_transcribe_ms"] = round(
+                (time.perf_counter() - transcribe_started) * 1000
+            )
+
+        segments_out = result.segments
+        text_out = result.text
+        if options.get("postprocess"):
+            def _pp(s: str) -> str:
+                out = canonicalize_technical_text(s)
+                if app.state.variant_post_processor is not None:
+                    out = app.state.variant_post_processor.convert_text(out)
+                return out
+
+            segments_out = [{**seg, "text": _pp(str(seg.get("text", "")))} for seg in segments_out]
+            text_out = _pp(text_out)
+
+        timings["server_total_ms"] = round((time.perf_counter() - request_started) * 1000)
+        device = format_transcription_device(app.state.transcriber)
+        print(
+            f"Transcribed Segments ({app.state.runtime_config.backend}, "
+            f"segments={len(segments_out)}, source={result.timestamp_source}, device={device}) | "
+            f"audio_bytes={timings['audio_bytes']} queue_wait_ms={timings['queue_wait_ms']} "
+            f"server_transcribe_ms={timings['server_transcribe_ms']} "
+            f"server_total_ms={timings['server_total_ms']}\n"
+        )
+        return {
+            "segments": segments_out,
+            "text": text_out,
+            "language": result.language,
+            "language_probability": result.language_probability,
+            "timestamp_source": result.timestamp_source,
+            "backend": app.state.runtime_config.backend,
+            "model": app.state.runtime_config.model_name,
+            "device": device,
+            "timings": timings,
+        }
+    except Exception as exc:
+        log_output.service_logger.exception("Segment transcription request failed")
+        timings["server_total_ms"] = round((time.perf_counter() - request_started) * 1000)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"{type(exc).__name__}: {exc}",
+                "backend": getattr(app.state.runtime_config, "backend", ""),
+                "model": getattr(app.state.runtime_config, "model_name", ""),
+                "timings": timings,
+            },
+        )
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @app.post("/client-event", include_in_schema=False)
