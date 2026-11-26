@@ -1241,6 +1241,27 @@ class FriendlyLogSourceTests(unittest.TestCase):
         self.assertTrue(FriendlyLogSource().filter(record))
         self.assertEqual(record.source, "Client")
 
+    def test_application_startup_complete_adds_blank_separator_line(self):
+        record = logging.LogRecord(
+            "uvicorn.error",
+            logging.INFO,
+            __file__,
+            1,
+            "Application startup complete.",
+            (),
+            None,
+        )
+        record.color_message = "Application startup complete."
+
+        source_filter = FriendlyLogSource()
+        self.assertTrue(source_filter.filter(record))
+        self.assertEqual(record.source, "Server")
+        self.assertEqual(record.getMessage(), "Application startup complete.\n")
+        self.assertEqual(record.color_message, "Application startup complete.\n")
+        # Idempotent if filtered more than once
+        self.assertTrue(source_filter.filter(record))
+        self.assertEqual(record.getMessage(), "Application startup complete.\n")
+
 
 if __name__ == "__main__":
     unittest.main()

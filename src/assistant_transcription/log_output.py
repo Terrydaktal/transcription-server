@@ -17,15 +17,26 @@ ANSI_RED = "\033[1;31m"
 
 class FriendlyLogSource(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
         if (
             record.name == "assistant.whisper"
-            and record.getMessage().startswith(("Delivery ", "Recording prepared:"))
+            and message.startswith(("Delivery ", "Recording prepared:"))
         ):
             record.source = "Client"
         elif record.name in {"assistant.whisper", "uvicorn", "uvicorn.access", "uvicorn.error"}:
             record.source = "Server"
         else:
             record.source = "Application"
+
+        if (
+            record.name == "uvicorn.error"
+            and message == "Application startup complete."
+            and not str(record.msg).endswith("\n")
+        ):
+            record.msg = f"{record.msg}\n"
+            color_message = getattr(record, "color_message", None)
+            if isinstance(color_message, str) and not color_message.endswith("\n"):
+                record.color_message = f"{color_message}\n"
         return True
 
 
