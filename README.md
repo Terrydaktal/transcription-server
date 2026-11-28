@@ -1,6 +1,6 @@
 # Transcription Server (`~/Dev/transcription-server`)
 
-Local GPU speech-to-text HTTP service exposing `POST /transcribe_raw` (`audio/wav`, `audio/flac`, or raw audio → `{"text": "...", "backend": "...", "model": "..."}` plus optional preprocessing and variant-conversion metadata) for all dictation clients ([`dictation`](https://github.com/Terrydaktal/dictation), [`voice-keyboard`](https://github.com/Terrydaktal/voice-keyboard), [`floating-dictation`](https://github.com/Terrydaktal/floating-dictation), and `~/Dev/assistant`).
+Local GPU speech-to-text HTTP service exposing `POST /transcribe_raw` (`audio/wav`, `audio/flac`, or raw audio → `{"text": "...", "backend": "...", "model": "..."}` plus optional preprocessing and variant-conversion metadata) for all dictation clients ([`dictation`](https://github.com/Terrydaktal/dictation), [`voice-keyboard`](https://github.com/Terrydaktal/voice-keyboard), [`floating-dictation`](https://github.com/Terrydaktal/floating-dictation), and `~/Dev/earpiece-assistant`).
 
 The [transcription experiment catalogue](docs/asr-experiments.md) records the models, settings, WER, punctuation, runtime, and memory results recovered from project history. It includes [CSV](docs/asr-experiments.csv) and [JSON evidence](docs/asr-experiments.json), and separates measured runs from failures and untested suggestions.
 
