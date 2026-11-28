@@ -1,6 +1,6 @@
 # Transcription Server (`~/Dev/transcription-server`)
 
-Local GPU speech-to-text HTTP service exposing `POST /transcribe_raw` (`audio/wav`, `audio/flac`, or raw audio → `{"text": "...", "backend": "...", "model": "..."}` plus optional preprocessing and variant-conversion metadata) for all dictation clients ([`linux-dictation`](https://github.com/Terrydaktal/linux-dictation), [`voice-keyboard`](https://github.com/Terrydaktal/voice-keyboard), [`floating-dictation`](https://github.com/Terrydaktal/floating-dictation), and `~/Dev/assistant`).
+Local GPU speech-to-text HTTP service exposing `POST /transcribe_raw` (`audio/wav`, `audio/flac`, or raw audio → `{"text": "...", "backend": "...", "model": "..."}` plus optional preprocessing and variant-conversion metadata) for all dictation clients ([`dictation`](https://github.com/Terrydaktal/dictation), [`voice-keyboard`](https://github.com/Terrydaktal/voice-keyboard), [`floating-dictation`](https://github.com/Terrydaktal/floating-dictation), and `~/Dev/assistant`).
 
 The [transcription experiment catalogue](docs/asr-experiments.md) records the models, settings, WER, punctuation, runtime, and memory results recovered from project history. It includes [CSV](docs/asr-experiments.csv) and [JSON evidence](docs/asr-experiments.json), and separates measured runs from failures and untested suggestions.
 
@@ -54,7 +54,7 @@ transcription-server/
   - Disable variant conversion with `--no-variant-conversion` or `WHISPER_VARIANT_CONVERSION=false`.
   - Override locales with `--variant-source` / `--variant-target` (`WHISPER_VARIANT_SOURCE` / `WHISPER_VARIANT_TARGET`).
 - **Diagnostic retention (`.transcription_recovery`):** Keeps the 20 most recent request recordings (`latest_request.wav` + 19 numbered history slots) and up to 20 timestamped failed request/error pairs. Configure with `--recovery-request-limit` (`WHISPER_RECOVERY_REQUEST_LIMIT`) and `--failed-recovery-limit` (`WHISPER_FAILED_RECOVERY_LIMIT`); `0` disables that category.
-- **Desktop queue wakeup & startup lock:** On startup, the server reserves a per-user, per-port lock before loading any model — launching a second instance on the same port exits with a warning without touching the running server or queued recordings (locks release automatically on exit or crash). Once bound, startup automatically wakes `~/Dev/linux-dictation/whisper/queue-worker.sh` if completed desktop recordings are waiting.
+- **Desktop queue wakeup & startup lock:** On startup, the server reserves a per-user, per-port lock before loading any model — launching a second instance on the same port exits with a warning without touching the running server or queued recordings (locks release automatically on exit or crash). Once bound, startup automatically wakes `~/Dev/dictation/whisper/queue-worker.sh` if completed desktop recordings are waiting.
 - **Logging:** Generic HTTP access logs are hidden by default (`--http-access-log` or `WHISPER_HTTP_ACCESS_LOG=true` enables them). Each result/failure timing block ends with a blank line and labels Whisper execution with `device=GPU`, `device=CPU`, `device=CPU(fallback)`, or `device=not-run`.
 
 ---

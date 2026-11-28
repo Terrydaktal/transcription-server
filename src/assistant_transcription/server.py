@@ -131,7 +131,7 @@ def resume_desktop_dictation_queue() -> None:
         configured_worker = os.environ.get("ASSISTANT_DESKTOP_QUEUE_WORKER")
         candidates = [
             *([Path(configured_worker)] if configured_worker else []),
-            Path.home() / "Dev" / "linux-dictation" / "whisper" / "queue-worker.sh",
+            Path.home() / "Dev" / "dictation" / "whisper" / "queue-worker.sh",
             REPO_ROOT / "desktop_dictation" / "queue-worker.sh",
         ]
         worker = next((path for path in candidates if path.is_file()), None)
